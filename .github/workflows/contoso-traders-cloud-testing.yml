@@ -7,12 +7,13 @@ on:
     paths-ignore: ["docs/**", "demo-scripts/**"]
 
 env:
-  # You can specify any location for `SUB_DEPLOYMENT_REGION`. It's the region where the deployment
-  # metadata will be stored, and not where the resource groups will be deployed.
   ACR_NAME: contosotradersacr
   AKS_CLUSTER_NAME: contoso-traders-aks
+  AKS_CPU_LIMIT: 250m
   AKS_DNS_LABEL: contoso-traders-products
+  AKS_MEMORY_LIMIT: 256Mi
   AKS_NODES_RESOURCE_GROUP_NAME: contoso-traders-aks-nodes-rg
+  AKS_REPLICAS: "1"
   AKS_SECRET_NAME_ACR_PASSWORD: contoso-traders-acr-password
   AKS_SECRET_NAME_KV_ENDPOINT: contoso-traders-kv-endpoint
   AKS_SECRET_NAME_MI_CLIENTID: contoso-traders-mi-clientid
@@ -37,7 +38,6 @@ env:
   PRODUCTS_CDN_ENDPOINT_NAME: contoso-traders-images
   RESOURCE_GROUP_NAME: contoso-traders-rg
   STORAGE_ACCOUNT_NAME: contosotradersimg
-  SUB_DEPLOYMENT_REGION: eastus2
   UI_CDN_ENDPOINT_NAME: contoso-traders-ui2
   UI_STORAGE_ACCOUNT_NAME: contosotradersui2
   USER_ASSIGNED_MANAGED_IDENTITY_NAME: contoso-traders-mi-kv-access
@@ -59,7 +59,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: azure login
         uses: azure/login@v1
         with:
@@ -136,9 +136,9 @@ jobs:
         uses: Azure/arm-deploy@v1
         with:
           scope: subscription
-          region: ${{ env.SUB_DEPLOYMENT_REGION }}
+          region: ${{ vars.DEPLOYMENTREGION }}
           template: ./iac/createResourceGroup.bicep
-          parameters: rgName=${{ env.RESOURCE_GROUP_NAME }} suffix=${{ vars.SUFFIX }}
+          parameters: rgName=${{ env.RESOURCE_GROUP_NAME }} suffix=${{ vars.SUFFIX }} rgLocation=${{ vars.DEPLOYMENTREGION }}
       # Next step is to deploy the Azure resources to the resource group `contoso-traders-rg` created above. The deployed resources
       # include storage accounts, function apps, app services cosmos db, and service bus etc.
       # The below step can also be manually executed as follows:
@@ -151,10 +151,10 @@ jobs:
         uses: Azure/arm-deploy@v1
         with:
           scope: resourcegroup
-          region: ${{ env.SUB_DEPLOYMENT_REGION }}
+          region: ${{ vars.DEPLOYMENTREGION }}
           resourceGroupName: ${{ env.RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }}
           template: ./iac/createResources.bicep
-          parameters: ./iac/createResources.parameters.json suffix=${{ vars.SUFFIX }} sqlPassword=${{ secrets.SQLPASSWORD }}
+          parameters: ./iac/createResources.parameters.json suffix=${{ vars.SUFFIX }} sqlPassword=${{ secrets.SQLPASSWORD }} deployPrivateEndpoints=${{ vars.DEPLOYPRIVATEENDPOINTS }}
       # Add the logged-in service principal to the key vault access policy
       - name: add service principal to kv access policy
         uses: azure/CLI@v1
@@ -170,7 +170,7 @@ jobs:
               --ids $(az vmss list -g ${{ env.AKS_NODES_RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }} --query "[0].id" -o tsv) \
       # Seed the DBs and storage accounts
       - name: seed products db
-        uses: azure/sql-action@v2.1
+        uses: azure/sql-action@v2.2
         with:
           connection-string: Server=tcp:${{ env.PRODUCTS_DB_SERVER_NAME }}${{ vars.SUFFIX }}.database.windows.net,1433;Initial Catalog=${{ env.PRODUCTS_DB_NAME }};Persist Security Info=False;User ID=${{ env.PRODUCTS_DB_USER_NAME }};Password=${{ secrets.SQLPASSWORD }};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;
           path: ./src/ContosoTraders.Api.Products/Migration/productsdb.sql
@@ -190,7 +190,10 @@ jobs:
         uses: azure/CLI@v1
         id: extract-acr-password
         with:
-          inlineScript: echo "acrPassword"="$(az acr credential show -n ${{ env.ACR_NAME }}${{ vars.SUFFIX }} -g ${{ env.RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }} --query "passwords[0].value" --output tsv)" >> $GITHUB_OUTPUT
+          inlineScript: |
+            acrPassword=$(az acr credential show -n ${{ env.ACR_NAME }}${{ vars.SUFFIX }} -g ${{ env.RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }} --query "passwords[0].value" --output tsv)
+            echo "::add-mask::$acrPassword"
+            echo acrPassword=$acrPassword >> $GITHUB_OUTPUT
       - name: azure container registry login
         uses: azure/docker-login@v1
         with:
@@ -216,6 +219,7 @@ jobs:
             az config set extension.use_dynamic_install=yes_without_prompt
             az containerapp update -n ${{ env.CARTS_ACA_NAME }}${{ vars.SUFFIX }} -g ${{ env.RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }} --image ${{ env.ACR_NAME }}${{ vars.SUFFIX }}.azurecr.io/${{ env.CARTS_ACR_REPOSITORY_NAME }}:${{ github.sha }}
       - name: deploy to aca (internal)
+        if: ${{ vars.DEPLOYPRIVATEENDPOINTS }}
         uses: azure/CLI@v1
         with:
           inlineScript: |
@@ -273,6 +277,9 @@ jobs:
           files: ./src/ContosoTraders.Api.Products/Manifests/Deployment.yaml
         env:
           SUFFIX: ${{ vars.SUFFIX }}
+          AKS_REPLICAS: ${{ env.AKS_REPLICAS }}
+          AKS_CPU_LIMIT: ${{ env.AKS_CPU_LIMIT }}
+          AKS_MEMORY_LIMIT: ${{ env.AKS_MEMORY_LIMIT }}
       - name: lint deployment manifest
         uses: azure/k8s-lint@v2.0
         with:
@@ -309,11 +316,11 @@ jobs:
           az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP_NAME }}${{ vars.SUFFIX }} --name ${{ env.AKS_CLUSTER_NAME }}${{ vars.SUFFIX }}
           ${{ steps.install-helm.outputs.helm-path }} repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
           ${{ steps.install-helm.outputs.helm-path }} repo update
-          ${{ steps.install-helm.outputs.helm-path }} upgrade --install nginx-ingress ingress-nginx/ingress-nginx \
+          ${{ steps.install-helm.outputs.helm-path }} upgrade --install --wait --timeout=1h nginx-ingress ingress-nginx/ingress-nginx \
             --set controller.replicaCount=1 \
-            --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
-            --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux \
-            --set controller.admissionWebhooks.patch.nodeSelector."beta\.kubernetes\.io/os"=linux \
+            --set controller.nodeSelector."kubernetes\.io/os"=linux \
+            --set defaultBackend.nodeSelector."kubernetes\.io/os"=linux \
+            --set controller.admissionWebhooks.patch.nodeSelector."kubernetes\.io/os"=linux \
             --set controller.service.externalTrafficPolicy=Local
       - name: set dns label on public ip
         uses: azure/CLI@v1
@@ -447,7 +454,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: azure login
         uses: azure/login@v1
         with:
@@ -465,7 +472,7 @@ jobs:
         run: sleep 30s
         shell: bash
       - name: load test (products API)
-        uses: Azure/load-testing@v1.1.13
+        uses: Azure/load-testing@v1.1.19
         with:
           # Path of the YAML file. Should be fully qualified path or relative to the default working directory
           loadtestConfigFile: ./loadtests/contoso-traders-products.yaml
@@ -500,6 +507,7 @@ jobs:
             ]
 
   load-tests-carts-internal-api:
+    if: ${{ vars.DEPLOYPRIVATEENDPOINTS }}
     needs: [provision, playwright-tests-ui]
     runs-on: ubuntu-22.04
     concurrency:
@@ -507,7 +515,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: azure login
         uses: azure/login@v1
         with:
@@ -531,7 +539,7 @@ jobs:
         env:
           LOAD_TEST_SUBNET_ID: ${{ steps.get-vnetAcaSubnetId.outputs.vnetAcaSubnetId }}
       - name: load test (carts internal API)
-        uses: Azure/load-testing@v1.1.13
+        uses: Azure/load-testing@v1.1.19
         with:
           # Path of the YAML file. Should be fully qualified path or relative to the default working directory
           loadtestConfigFile: ./loadtests/contoso-traders-carts-internal.yaml
@@ -573,13 +581,13 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: azure login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.SERVICEPRINCIPAL }}
       - name: load test (carts API)
-        uses: Azure/load-testing@v1.1.13
+        uses: Azure/load-testing@v1.1.19
         with:
           # Path of the YAML file. Should be fully qualified path or relative to the default working directory
           loadtestConfigFile: ./loadtests/contoso-traders-carts.yaml
@@ -618,7 +626,7 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-22.04
     container:
-      image: mcr.microsoft.com/playwright:v1.32.0-jammy
+      image: mcr.microsoft.com/playwright:v1.36.2-jammy
     defaults:
       run:
         working-directory: src/ContosoTraders.Ui.Website
@@ -626,7 +634,7 @@ jobs:
       AADUSERNAME: ${{ secrets.AADUSERNAME }}
       AADPASSWORD: ${{ secrets.AADPASSWORD }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v3
         with:
           node-version: 18
@@ -646,10 +654,12 @@ jobs:
       - name: install dependencies
         run: npm ci
       - name: run playwright tests
+        id: test
         run: HOME=/root npx playwright test
       - name: upload playwright report
         uses: actions/upload-artifact@v3
-        if: always()
+        # only upload report if tests failed
+        if: steps.test.outcome != 'success'
         with:
           name: playwright-report
           path: src/ContosoTraders.Ui.Website/playwright-report/

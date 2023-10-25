@@ -13,8 +13,19 @@ param rgName string
 @description('A unique environment suffix (max 6 characters, alphanumeric only).')
 param suffix string
 
-@description('Set default rg location to East US.')
-param rgLocation string = 'eastus'
+@description('Set rg location')
+@allowed([
+  'australiaeast'
+  'centralus'
+  'eastus'
+  'eastus2'
+  'japaneast'
+  'northcentralus'
+  'uksouth'
+  'westcentralus'
+  'westeurope'
+])
+param rgLocation string
 
 // variables
 ////////////////////////////////////////////////////////////////////////////////

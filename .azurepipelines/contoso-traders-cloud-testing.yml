@@ -1,4 +1,4 @@
-name: contoso-traders-cloud-testing.yml
+name: contoso-traders-cloud-testing
 
 trigger:
   - main
@@ -9,7 +9,7 @@ pr:
       - main
   paths:
     exclude:
-      - "docs/**" 
+      - "docs/**"
       - "demo-scripts/**"
 
 variables:
@@ -18,10 +18,16 @@ variables:
     value: contosotradersacr
   - name: AKS_CLUSTER_NAME
     value: contoso-traders-aks
+  - name: AKS_CPU_LIMIT
+    value: 250m
   - name: AKS_DNS_LABEL
     value: contoso-traders-products
+  - name: AKS_MEMORY_LIMIT
+    value: 256Mi
   - name: AKS_NODES_RESOURCE_GROUP_NAME
     value: contoso-traders-aks-nodes-rg
+  - name: AKS_REPLICAS
+    value: "1"
   - name: AKS_SECRET_NAME_ACR_PASSWORD
     value: contoso-traders-acr-password
   - name: AKS_SECRET_NAME_KV_ENDPOINT
@@ -70,8 +76,6 @@ variables:
     value: contoso-traders-rg
   - name: STORAGE_ACCOUNT_NAME
     value: contosotradersimg
-  - name: SUB_DEPLOYMENT_REGION
-    value: eastus2
   - name: UI_CDN_ENDPOINT_NAME
     value: contoso-traders-ui2
   - name: UI_STORAGE_ACCOUNT_NAME
@@ -177,9 +181,9 @@ stages:
             inputs:
               deploymentScope: Subscription
               azureResourceManagerConnection: SERVICEPRINCIPAL
-              location: $(SUB_DEPLOYMENT_REGION)
+              location: $(DEPLOYMENTREGION)
               csmFile: ./iac/createResourceGroup.bicep
-              overrideParameters: -rgName $(RESOURCE_GROUP_NAME) -suffix $(SUFFIX)
+              overrideParameters: -rgName $(RESOURCE_GROUP_NAME) -suffix $(SUFFIX) -rgLocation $(DEPLOYMENTREGION)
           # Next step is to deploy the Azure resources to the resource group `contoso-traders-rg` created above. The deployed resources
           # include storage accounts, function apps, app services cosmos db, and service bus etc.
           # The below step can also be manually executed as follows:
@@ -193,7 +197,7 @@ stages:
             inputs:
               deploymentScope: Resource Group
               azureResourceManagerConnection: SERVICEPRINCIPAL
-              location: $(SUB_DEPLOYMENT_REGION)
+              location: $(DEPLOYMENTREGION)
               resourceGroupName: "$(RESOURCE_GROUP_NAME)$(SUFFIX)"
               csmFile: ./iac/createResources.bicep
               csmParametersFile: ./iac/createResources.parameters.json
@@ -243,7 +247,7 @@ stages:
             inputs:
               azureSubscription: SERVICEPRINCIPAL
               scriptLocation: inlineScript
-              inlineScript: echo "##vso[task.setvariable variable=acrPassword;isOutput=true]$(az acr credential show -n $(ACR_NAME)$(SUFFIX) -g $(RESOURCE_GROUP_NAME)$(SUFFIX) --query "passwords[0].value" --output tsv)"
+              inlineScript: echo "##vso[task.setvariable variable=acrPassword;isOutput=true;issecret=true]$(az acr credential show -n $(ACR_NAME)$(SUFFIX) -g $(RESOURCE_GROUP_NAME)$(SUFFIX) --query "passwords[0].value" --output tsv)"
           - script: docker login $(ACR_NAME)$(SUFFIX).azurecr.io --username $(ACR_NAME)$(SUFFIX) --password $(extractAcrPassword.acrPassword)
             displayName: azure container registry login
           - task: AzureCLI@1
@@ -270,6 +274,7 @@ stages:
                 az containerapp update -n $(CARTS_ACA_NAME)$(SUFFIX) -g $(RESOURCE_GROUP_NAME)$(SUFFIX) --image $(ACR_NAME)$(SUFFIX).azurecr.io/$(CARTS_ACR_REPOSITORY_NAME):$(Build.SourceVersion)
           - task: AzureCLI@1
             displayName: deploy to aca (internal)
+            condition: ne(variables['DEPLOYPRIVATEENDPOINTS'], '')
             inputs:
               azureSubscription: SERVICEPRINCIPAL
               scriptLocation: inlineScript
@@ -343,7 +348,11 @@ stages:
               tokenPattern: custom
               tokenPrefix: "{"
               tokenSuffix: "}"
-              inlineVariables: "SUFFIX: $(SUFFIX)"
+              inlineVariables: |
+                SUFFIX: "$(SUFFIX)"
+                AKS_REPLICAS: "$(AKS_REPLICAS)"
+                AKS_CPU_LIMIT: "$(AKS_CPU_LIMIT)"
+                AKS_MEMORY_LIMIT: "$(AKS_MEMORY_LIMIT)"
           - task: KubernetesManifest@1
             displayName: apply deployment manifest
             inputs:
@@ -385,11 +394,11 @@ stages:
               az aks get-credentials --resource-group $(RESOURCE_GROUP_NAME)$(SUFFIX) --name $(AKS_CLUSTER_NAME)$(SUFFIX)
               helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
               helm repo update
-              helm upgrade --install nginx-ingress ingress-nginx/ingress-nginx \
+              helm upgrade --install --wait --timeout=1h nginx-ingress ingress-nginx/ingress-nginx \
                 --set controller.replicaCount=1 \
-                --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
-                --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux \
-                --set controller.admissionWebhooks.patch.nodeSelector."beta\.kubernetes\.io/os"=linux \
+                --set controller.nodeSelector."kubernetes\.io/os"=linux \
+                --set defaultBackend.nodeSelector."kubernetes\.io/os"=linux \
+                --set controller.admissionWebhooks.patch.nodeSelector."kubernetes\.io/os"=linux \
                 --set controller.service.externalTrafficPolicy=Local
             displayName: create ingress controller
           - task: AzureCLI@1
@@ -604,6 +613,7 @@ stages:
                 ]
 
       - job: load_tests_carts_internal_api
+        condition: ne(variables['DEPLOYPRIVATEENDPOINTS'], '')
         dependsOn: [provision, playwright_tests_ui]
         steps:
           - task: AzureCLI@1
@@ -705,7 +715,7 @@ stages:
 
       - job: playwright_tests_ui
         dependsOn: [provision]
-        container: mcr.microsoft.com/playwright:v1.32.0-focal
+        container: mcr.microsoft.com/playwright:v1.36.2-jammy
         variables:
           APIURLSHOPPINGCART: $[ dependencies.provision.outputs['getCartsApiEndpoint.cartsApiEndpoint'] ]
           APIURL: $[ dependencies.provision.outputs['getProductsApiEndpoint.productsApiEndpoint'] ]
@@ -750,9 +760,10 @@ stages:
               mergeTestResults: true
               failTaskOnFailedTests: true
               testRunTitle: Playwright Tests
-          - task: PublishPipelineArtifact@1
+          - task: PublishBuildArtifacts@1
             displayName: upload playwright report
-            condition: always()
+            condition: failed()
             inputs:
-              artifact: playwright-report
-              targetPath: src/ContosoTraders.Ui.Website/playwright-report
+              PathtoPublish: 'src/ContosoTraders.Ui.Website/playwright-report'
+              ArtifactName: 'playwright-report'
+              publishLocation: 'Container'              
